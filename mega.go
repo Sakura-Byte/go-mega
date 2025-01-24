@@ -176,14 +176,28 @@ func generateRandomIPv6(cidr *net.IPNet) (net.IP, error) {
 	ip := make(net.IP, len(cidr.IP))
 	copy(ip, cidr.IP)
 
-	randBytes := make([]byte, len(ip)-cidr.Mask.Size()/8)
+	// Get prefix length and total bits
+	prefixOnes, totalBits := cidr.Mask.Size()
+
+	// Calculate host portion size in bytes
+	hostBits := totalBits - prefixOnes
+	hostBytes := (hostBits + 7) / 8 // Round up to cover partial bytes
+
+	randBytes := make([]byte, hostBytes)
 	if _, err := rand.Read(randBytes); err != nil {
 		return nil, err
 	}
 
-	for i := range randBytes {
-		ip[len(cidr.Mask)/8+i] = randBytes[i]
+	// Apply random bytes to host portion
+	startByte := prefixOnes / 8
+	for i := 0; i < hostBytes; i++ {
+		bytePos := startByte + i
+		if bytePos >= len(ip) {
+			break
+		}
+		ip[bytePos] = randBytes[i]
 	}
+
 	return ip, nil
 }
 
