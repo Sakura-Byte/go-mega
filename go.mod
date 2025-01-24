@@ -1,4 +1,4 @@
-module github.com/t3rm1n4l/go-mega
+module github.com/Sakura-Byte/go-mega
 
 require golang.org/x/crypto v0.31.0
 
