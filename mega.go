@@ -10,10 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math/big"
 	mrand "math/rand"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -131,6 +131,60 @@ type Mega struct {
 	waitEventsMu sync.Mutex
 	// Outstanding channels to close to indicate events all received
 	waitEvents []chan struct{}
+	// ipv6CIDR is the CIDR for the ipv6 network
+	ipv6CIDR *net.IPNet
+}
+
+func (m *Mega) AutoConfigureIPv6CIDR() error {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return err
+	}
+
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 ||
+			iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+
+			ip := ipNet.IP.To16()
+			if ip == nil || !ip.IsGlobalUnicast() {
+				continue
+			}
+
+			if ones, bits := ipNet.Mask.Size(); bits == 128 && ones <= 64 {
+				m.ipv6CIDR = ipNet
+				return nil
+			}
+		}
+	}
+	return errors.New("no suitable IPv6 CIDR found")
+}
+
+func generateRandomIPv6(cidr *net.IPNet) (net.IP, error) {
+	ip := make(net.IP, len(cidr.IP))
+	copy(ip, cidr.IP)
+
+	randBytes := make([]byte, len(ip)-cidr.Mask.Size()/8)
+	if _, err := rand.Read(randBytes); err != nil {
+		return nil, err
+	}
+
+	for i := range randBytes {
+		ip[len(cidr.Mask)/8+i] = randBytes[i]
+	}
+	return ip, nil
 }
 
 // Filesystem node types
@@ -435,7 +489,7 @@ func (m *Mega) api_request(r []byte) (buf []byte, err error) {
 			_ = resp.Body.Close()
 			continue
 		}
-		buf, err = ioutil.ReadAll(resp.Body)
+		buf, err = io.ReadAll(resp.Body)
 		if err != nil {
 			_ = resp.Body.Close()
 			continue
@@ -971,6 +1025,7 @@ type Download struct {
 	mutex       sync.Mutex // to protect the following
 	chunks      []chunkSize
 	chunk_macs  [][]byte
+	client      *http.Client
 }
 
 // an all nil IV for mac calculations
@@ -1057,6 +1112,28 @@ func (m *Mega) NewDownload(src *Node) (*Download, error) {
 		chunks:      chunks,
 		chunk_macs:  make([][]byte, len(chunks)),
 	}
+	// IPv6 initialization (only once per download)
+	if m.ipv6CIDR != nil {
+		ip, err := generateRandomIPv6(m.ipv6CIDR)
+		if err == nil {
+			d.client = &http.Client{
+				Transport: &http.Transport{
+					DialContext: (&net.Dialer{
+						LocalAddr: &net.TCPAddr{
+							IP:   ip,
+							Port: 0, // Let OS choose port
+						},
+					}).DialContext,
+				},
+				Timeout: m.client.Timeout,
+			}
+			m.debugf("Using IPv6 %s for entire download", ip.String())
+		}
+	}
+	// Fallback to default client if IPv6 not configured
+	if d.client == nil {
+		d.client = m.client
+	}
 	return d, nil
 }
 
@@ -1091,7 +1168,7 @@ func (d *Download) DownloadChunk(id int) (chunk []byte, err error) {
 	chunk_url := fmt.Sprintf("%s/%d-%d", d.resourceUrl, chk_start, chk_start+int64(chk_size)-1)
 	sleepTime := minSleepTime // inital backoff time
 	for retry := 0; retry < d.m.retries+1; retry++ {
-		resp, err = d.m.client.Get(chunk_url)
+		resp, err = d.client.Get(chunk_url)
 		if err == nil {
 			if resp.StatusCode == 200 {
 				break
@@ -1109,7 +1186,7 @@ func (d *Download) DownloadChunk(id int) (chunk []byte, err error) {
 		return nil, errors.New("retries exceeded")
 	}
 
-	chunk, err = ioutil.ReadAll(resp.Body)
+	chunk, err = io.ReadAll(resp.Body)
 	if err != nil {
 		_ = resp.Body.Close()
 		return nil, err
@@ -1464,7 +1541,7 @@ func (u *Upload) UploadChunk(id int, chunk []byte) (err error) {
 		return errors.New("retries exceeded")
 	}
 
-	chunk_resp, err = ioutil.ReadAll(rsp.Body)
+	chunk_resp, err = io.ReadAll(rsp.Body)
 	if err != nil {
 		_ = rsp.Body.Close()
 		return err
@@ -1935,7 +2012,7 @@ func (m *Mega) pollEvents() {
 			continue
 		}
 
-		buf, err := ioutil.ReadAll(resp.Body)
+		buf, err := io.ReadAll(resp.Body)
 		if err != nil {
 			m.logf("pollEvents: Error reading body: %v", err)
 			_ = resp.Body.Close()
