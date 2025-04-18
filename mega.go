@@ -221,6 +221,7 @@ type Node struct {
 	size     int64
 	ts       time.Time
 	meta     NodeMeta
+	isShared bool
 }
 
 func (n *Node) removeChild(c *Node) bool {
@@ -297,6 +298,9 @@ type MegaFS struct {
 	lookup map[string]*Node
 	skmap  map[string]string
 	mutex  sync.Mutex
+	// Fields for shared folder context
+	folderHandle string
+	folderKey    []uint32 // Store the key used to init the shared FS
 }
 
 // Get filesystem root node
@@ -1040,6 +1044,7 @@ type Download struct {
 	chunks      []chunkSize
 	chunk_macs  [][]byte
 	client      *http.Client
+	isShared    bool // Flag to indicate if the download is from a shared link
 }
 
 // an all nil IV for mac calculations
@@ -1048,7 +1053,7 @@ var zero_iv = make([]byte, 16)
 // Create a new Download from the src Node
 //
 // Call Chunks to find out how many chunks there are, then for id =
-// 0..chunks-1 call DownloadChunk.  Finally call Finish() to receive
+// 0..chunks-1 call DownloadChunk. Finally call Finish() to receive
 // the error status.
 func (m *Mega) NewDownload(src *Node) (*Download, error) {
 	if src == nil {
@@ -1058,60 +1063,246 @@ func (m *Mega) NewDownload(src *Node) (*Download, error) {
 	var msg [1]DownloadMsg
 	var res [1]DownloadResp
 
-	m.FS.mutex.Lock()
-	msg[0].Cmd = "g"
-	msg[0].G = 1
-	msg[0].N = src.hash
-	if m.config.https {
-		msg[0].SSL = 2
-	}
-	key := src.meta.key
-	m.FS.mutex.Unlock()
-
-	request, err := json.Marshal(msg)
-	if err != nil {
-		return nil, err
-	}
-	result, err := m.api_request(request)
-	if err != nil {
-		return nil, err
+	// Check if this is a shared folder context
+	isShared := src.isShared
+	var fsFolderHandle string
+	var fsFolderKey []uint32
+	if isShared {
+		m.FS.mutex.Lock()
+		fsFolderHandle = m.FS.folderHandle
+		fsFolderKey = m.FS.folderKey
+		m.FS.mutex.Unlock()
+		m.debugf("NewDownload called in shared context for node %s (handle: %s)", src.hash, fsFolderHandle)
+	} else {
+		m.debugf("NewDownload called in standard context for node %s", src.hash)
 	}
 
-	err = json.Unmarshal(result, &res)
-	if err != nil {
-		return nil, err
+	var fileKeyBytes []byte
+	var ivBytes []byte
+	var downloadUrl string
+	var fileSize int64
+	var err error
+
+	if isShared {
+		// Logic adapted from DownloadSharedFile for shared link download setup
+		m.debugf("NewDownload called in shared context for node %s (handle: %s)", src.hash, fsFolderHandle)
+		var sharedMsg [1]struct {
+			Cmd string `json:"a"`
+			G   int    `json:"g"`
+			V   int    `json:"v"`
+			SSL int    `json:"ssl"`
+			N   string `json:"n"`
+		}
+		sharedMsg[0].Cmd = "g"
+		sharedMsg[0].G = 1
+		sharedMsg[0].V = 2 // Use v2 for shared downloads
+		if m.config.https {
+			sharedMsg[0].SSL = 1
+		} else {
+			sharedMsg[0].SSL = 0
+		}
+		sharedMsg[0].N = src.hash
+
+		// Create the API URL with the folder handle
+		// Use a temporary sequence number for this request, separate from main api_request sequence
+		tempSn := m.sn + 1000 // Use an offset to avoid collision, though not strictly necessary with separate call
+		url := fmt.Sprintf("%s/cs?id=%d", m.baseurl, tempSn)
+		if m.sid != "" {
+			url = fmt.Sprintf("%s&sid=%s", url, m.sid)
+		}
+		url = fmt.Sprintf("%s&n=%s", url, fsFolderHandle)
+
+		request, err := json.Marshal(sharedMsg)
+		if err != nil {
+			return nil, err
+		}
+
+		// Perform the API request directly, without using the main api_request method
+		// to avoid global mutex and sequence number increment issues within download setup.
+		var sharedResult []byte
+		sleepTime := minSleepTime
+		for i := 0; i < m.retries+1; i++ {
+			if i != 0 {
+				m.debugf("Retry shared download API request %d/%d for node %s: %v", i, m.retries, src.hash, err)
+				backOffSleep(&sleepTime)
+			}
+			sharedResp, postErr := m.client.Post(url, "application/json", bytes.NewBuffer(request))
+			if postErr != nil {
+				m.debugf("Shared download API POST error (attempt %d): %v", i+1, postErr)
+				err = postErr // Store the last error
+				continue
+			}
+
+			sharedResult, readErr := io.ReadAll(sharedResp.Body)
+			bodyCloseErr := sharedResp.Body.Close()
+			if readErr != nil { // Prioritize read error
+				m.debugf("Shared download API ReadAll error (attempt %d): %v", i+1, readErr)
+				err = readErr // Store the last error
+				continue
+			}
+			if bodyCloseErr != nil { // Log close error if it happens
+				m.debugf("Shared download API Body.Close error (attempt %d): %v", i+1, bodyCloseErr)
+				// Potentially continue or return based on severity, for now continue
+			}
+
+			if sharedResp.StatusCode != 200 {
+				// Try to parse error from body
+				var apiErr []ErrorMsg
+				if json.Unmarshal(sharedResult, &apiErr) == nil && len(apiErr) > 0 {
+					err = parseError(apiErr[0])
+				} else {
+					err = fmt.Errorf("http status %s: %s", sharedResp.Status, string(sharedResult))
+				}
+
+				if err == EAGAIN { // Check for EAGAIN specifically for retrying
+					m.debugf("Shared download API got EAGAIN (attempt %d), retrying...", i+1)
+					continue
+				}
+				m.debugf("Shared download API non-200 status (attempt %d): %v", i+1, err)
+				continue // Continue retrying on other non-200 errors for now
+			}
+
+			// Success
+			m.debugf("Shared download API request successful for node %s (attempt %d)", src.hash, i+1)
+			err = nil // Clear error on success
+			break
+		}
+		if err != nil { // If loop finishes with an error
+			return nil, fmt.Errorf("failed shared download API request after %d attempts for node %s: %w", m.retries+1, src.hash, err)
+		}
+
+		// Parse the shared download response
+		var dlRes [1]struct {
+			G    []string `json:"g"`  // Array of download URLs
+			Size int64    `json:"s"`  // File size
+			At   string   `json:"at"` // Encrypted attributes
+		}
+		err = json.Unmarshal(sharedResult, &dlRes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse shared download response: %w, response: %s", err, sharedResult)
+		}
+
+		if len(dlRes[0].G) == 0 {
+			return nil, errors.New("no download URLs available in shared download response")
+		}
+
+		downloadUrl = dlRes[0].G[0]
+		fileSize = dlRes[0].Size
+
+		// Derive file key and IV from the stored folderKey
+		key := fsFolderKey // Use the key stored in FS
+		if len(key) < 8 {
+			return nil, fmt.Errorf("invalid shared folder key length: %d", len(key))
+		}
+		fileKey := []uint32{
+			key[0] ^ key[4],
+			key[1] ^ key[5],
+			key[2] ^ key[6],
+			key[3] ^ key[7],
+		}
+		fileKeyBytes, err = a32_to_bytes(fileKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert shared file key: %w", err)
+		}
+		// Use IV derived from shared folder key components
+		ivBytes, err = a32_to_bytes([]uint32{key[4], key[5], key[4], key[5]})
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert shared file IV: %w", err)
+		}
+
+		// Decrypt attributes if possible (best effort)
+		if dlRes[0].At != "" {
+			_, errAttr := decryptAttr(fileKeyBytes, dlRes[0].At)
+			if errAttr != nil {
+				m.debugf("Failed to decrypt attributes for shared node %s: %v", src.hash, errAttr)
+			}
+			// Ignore error, name might already be set correctly from NewSharedFS
+		}
+
+	} else {
+		// Standard download logic for non-shared files
+		m.debugf("NewDownload called in standard context for node %s", src.hash)
+		m.FS.mutex.Lock()
+		msg[0].Cmd = "g"
+		msg[0].G = 1
+		msg[0].N = src.hash
+		if m.config.https {
+			msg[0].SSL = 2
+		}
+
+		var keyBytes []byte
+		// Use key from node metadata if available
+		if len(src.meta.key) > 0 {
+			keyBytes = src.meta.key
+		} else {
+			m.logf("Warning: Missing meta.key for non-shared node %s", src.hash)
+			m.FS.mutex.Unlock()
+			return nil, fmt.Errorf("missing decryption key for node %s", src.hash)
+		}
+
+		// Derive IV from node metadata if available
+		if len(src.meta.iv) > 0 {
+			t, err := bytes_to_a32(src.meta.iv)
+			if err != nil {
+				m.FS.mutex.Unlock()
+				return nil, fmt.Errorf("failed to parse IV for node %s: %w", src.hash, err)
+			}
+			// Standard IV calculation
+			ivBytes, err = a32_to_bytes([]uint32{t[0], t[1], t[0], t[1]})
+			if err != nil {
+				m.FS.mutex.Unlock()
+				return nil, fmt.Errorf("failed to convert IV for node %s: %w", src.hash, err)
+			}
+		} else {
+			m.logf("Warning: Missing meta.iv for non-shared node %s", src.hash)
+			m.FS.mutex.Unlock()
+			return nil, fmt.Errorf("missing IV for node %s", src.hash)
+		}
+		m.FS.mutex.Unlock()
+
+		request, err := json.Marshal(msg)
+		if err != nil {
+			return nil, err
+		}
+		result, err := m.api_request(request) // Use standard API request for regular files
+		if err != nil {
+			return nil, err // Error includes API error parsing already
+		}
+
+		err = json.Unmarshal(result, &res)
+		if err != nil {
+			// Attempt to parse as error if unmarshal fails
+			var apiErr []ErrorMsg
+			if json.Unmarshal(result, &apiErr) == nil && len(apiErr) > 0 {
+				return nil, parseError(apiErr[0])
+			}
+			return nil, fmt.Errorf("failed to parse standard download response: %w, response: %s", err, result)
+		}
+
+		// DownloadResp has an embedded error in it for some reason
+		if res[0].Err != 0 {
+			return nil, parseError(res[0].Err)
+		}
+
+		// Decrypt attributes using the node's key
+		_, err = decryptAttr(keyBytes, res[0].Attr)
+		if err != nil {
+			return nil, err
+		}
+		downloadUrl = res[0].G
+		fileSize = int64(res[0].Size)
 	}
 
-	// DownloadResp has an embedded error in it for some reason
-	if res[0].Err != 0 {
-		return nil, parseError(res[0].Err)
-	}
+	// Common download setup
+	chunks := getChunkSizes(fileSize)
 
-	_, err = decryptAttr(key, res[0].Attr)
-	if err != nil {
-		return nil, err
-	}
-
-	chunks := getChunkSizes(int64(res[0].Size))
-
-	aes_block, err := aes.NewCipher(key)
+	aes_block, err := aes.NewCipher(fileKeyBytes)
 	if err != nil {
 		return nil, err
 	}
 
 	mac_enc := cipher.NewCBCEncrypter(aes_block, zero_iv)
-	m.FS.mutex.Lock()
-	t, err := bytes_to_a32(src.meta.iv)
-	m.FS.mutex.Unlock()
-	if err != nil {
-		return nil, err
-	}
-	iv, err := a32_to_bytes([]uint32{t[0], t[1], t[0], t[1]})
-	if err != nil {
-		return nil, err
-	}
 
-	downloadUrl := res[0].G
 	if m.config.https && strings.HasPrefix(downloadUrl, "http://") {
 		downloadUrl = "https://" + strings.TrimPrefix(downloadUrl, "http://")
 	}
@@ -1121,10 +1312,11 @@ func (m *Mega) NewDownload(src *Node) (*Download, error) {
 		src:         src,
 		resourceUrl: downloadUrl,
 		aes_block:   aes_block,
-		iv:          iv,
+		iv:          ivBytes, // Use the correctly derived IV
 		mac_enc:     mac_enc,
 		chunks:      chunks,
 		chunk_macs:  make([][]byte, len(chunks)),
+		isShared:    isShared, // Set flag to indicate shared context
 	}
 	// IPv6 initialization (only once per download)
 	if m.ipv6CIDR != nil {
@@ -1139,12 +1331,15 @@ func (m *Mega) NewDownload(src *Node) (*Download, error) {
 						},
 					}).DialContext,
 				},
-				Timeout: m.client.Timeout,
+				Timeout: m.client.Timeout, // Use the main client's timeout
 			}
-			m.debugf("Using IPv6 %s for entire download", ip.String())
+			m.debugf("Using IPv6 %s for download of %s", ip.String(), src.name)
+		} else {
+			m.debugf("Failed to generate random IPv6, falling back to default client for %s: %v", src.name, err)
+			d.client = m.client // Fallback
 		}
 	}
-	// Fallback to default client if IPv6 not configured
+	// Fallback to default client if IPv6 not configured or failed
 	if d.client == nil {
 		d.client = m.client
 	}
@@ -1254,6 +1449,12 @@ func (d *Download) DownloadChunk(id int) (chunk []byte, err error) {
 //
 // If all the chunks weren't downloaded then it will just return nil
 func (d *Download) Finish() (err error) {
+	// Skip MAC check for shared downloads as MAC info is not available
+	if d.isShared {
+		d.m.debugf("Skipping MAC check for shared download: %s", d.src.name)
+		return nil
+	}
+
 	// Can't check a 0 sized file
 	if len(d.chunk_macs) == 0 {
 		return nil
@@ -2375,6 +2576,8 @@ func (m *Mega) NewSharedFS(handle, key string) (*MegaFS, error) {
 
 	// Create a new filesystem
 	fs := newMegaFS()
+	fs.folderKey = shareKeyUint32 // Store the key
+	fs.folderHandle = handle      // Store the handle
 
 	// Fetch the folder structure
 	var msg [1]ShareFolderMsg
@@ -2473,6 +2676,7 @@ func (m *Mega) NewSharedFS(handle, key string) (*MegaFS, error) {
 						if err == nil {
 							// If we successfully decrypted attributes, update the node name
 							n.name = attr.Name
+							n.isShared = true
 							m.debugf("Successfully decrypted name for %s: %s", f.Hash, n.name)
 						} else {
 							m.debugf("Error decrypting attributes for file %s: %v", f.Hash, err)

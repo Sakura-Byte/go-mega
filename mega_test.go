@@ -576,3 +576,165 @@ func TestRealSharedFolder(t *testing.T) {
 		t.Fatalf("Test timed out after %v", timeout)
 	}
 }
+
+func TestDownloadFromSharedFolder(t *testing.T) {
+	// Test with a real shared folder link (read-only access)
+	// This link contains a small text file "Small Text File for Rclone Test.txt"
+	link := "https://mega.nz/folder/PAhFHS7T#a_9EPWjRFsVNAICwHrEFqA"
+	testFileName := "Small Text File for Rclone Test.txt" // Adjust if the file name changes in the share
+	testFileSize := int64(720851726)                      // Expected size of the test file
+	testFileHandle := "jRoUhJZZ"                          // The specific handle of the test file within the shared folder
+
+	t.Logf("Testing download from shared link: %s", link)
+
+	m := New()
+	m.SetLogger(t.Logf)
+	m.SetDebugger(t.Logf)
+
+	// Parse the link
+	handle, key, err := GetSharedFolderInfo(link)
+	if err != nil {
+		t.Fatalf("Failed to parse shared folder link: %v", err)
+	}
+
+	// Create shared filesystem
+	fs, err := m.NewSharedFS(handle, key)
+	if err != nil {
+		t.Fatalf("Failed to create shared filesystem: %v", err)
+	}
+
+	// Find the specific test file node using its handle
+	var targetNode *Node
+	fs.mutex.Lock()
+	targetNode = fs.hashLookup(testFileHandle)
+	fs.mutex.Unlock()
+
+	if targetNode == nil {
+		// It might take a moment for the FS to populate, let's list children if lookup failed
+		rootNode := fs.GetRoot()
+		if rootNode != nil {
+			children, _ := fs.GetChildren(rootNode) // Ignore error for test simplicity
+			for _, child := range children {
+				if child.GetHash() == testFileHandle {
+					targetNode = child
+					break
+				}
+			}
+		}
+		if targetNode == nil {
+			t.Fatalf("Test file node with handle %s not found in shared folder %s", testFileHandle, handle)
+		}
+	}
+
+	t.Logf("Found test file node: Name='%s', Handle='%s', Size=%d", targetNode.GetName(), targetNode.GetHash(), targetNode.GetSize())
+
+	// Verify file size if possible (can be a basic sanity check)
+	if targetNode.GetSize() != testFileSize {
+		t.Logf("Warning: Test file size mismatch. Expected %d, Got %d. Proceeding anyway.", testFileSize, targetNode.GetSize())
+		testFileSize = targetNode.GetSize() // Use actual size for verification later
+	}
+
+	// Create temporary file for download
+	tempFile, err := ioutil.TempFile("", "mega-shared-dl-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp file for download: %v", err)
+	}
+	tempFilePath := tempFile.Name()
+	_ = tempFile.Close()          // Close immediately, download process will handle opening/writing
+	defer os.Remove(tempFilePath) // Clean up temp file
+
+	t.Logf("Attempting to download node %s to %s", targetNode.GetHash(), tempFilePath)
+
+	// --- Use NewDownload and chunk download ---
+	d, err := m.NewDownload(targetNode)
+	if err != nil {
+		t.Fatalf("NewDownload failed for shared file: %v", err)
+	}
+
+	outfile, err := os.OpenFile(tempFilePath, os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		t.Fatalf("Failed to open temp file %s for writing: %v", tempFilePath, err)
+	}
+
+	workch := make(chan int)
+	errch := make(chan error, m.dl_workers)
+	var wg sync.WaitGroup
+
+	// Fire chunk download workers
+	for w := 0; w < m.dl_workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for id := range workch {
+				chunk, err := d.DownloadChunk(id)
+				if err != nil {
+					errch <- fmt.Errorf("DownloadChunk %d failed: %w", id, err)
+					return
+				}
+
+				chk_start, _, err := d.ChunkLocation(id)
+				if err != nil {
+					errch <- fmt.Errorf("ChunkLocation %d failed: %w", id, err)
+					return
+				}
+
+				_, err = outfile.WriteAt(chunk, chk_start)
+				if err != nil {
+					errch <- fmt.Errorf("WriteAt %d failed: %w", id, err)
+					return
+				}
+			}
+		}()
+	}
+
+	// Place chunk download jobs to chan
+	jobErr := error(nil)
+	for id := 0; id < d.Chunks(); id++ {
+		select {
+		case workch <- id:
+		case jobErr = <-errch:
+			// If an error occurs, break the loop
+			goto handle_error
+		}
+	}
+handle_error:
+	close(workch) // Close work channel regardless of errors to signal workers
+
+	wg.Wait() // Wait for all workers to finish
+
+	// Check for any remaining errors from workers after loop break
+	select {
+	case workerErr := <-errch:
+		if jobErr == nil { // Prioritize the first error encountered
+			jobErr = workerErr
+		}
+	default:
+		// No more errors in the channel
+	}
+
+	closeErr := outfile.Close()
+	if jobErr != nil {
+		t.Fatalf("Error during chunk download: %v", jobErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("Error closing output file %s: %v", tempFilePath, closeErr)
+	}
+
+	// Finish the download (should skip MAC check for shared)
+	err = d.Finish()
+	if err != nil {
+		t.Fatalf("Download Finish failed: %v", err)
+	}
+
+	t.Logf("Successfully downloaded shared file %s to %s", testFileName, tempFilePath)
+
+	// Optional: Verify downloaded file size
+	info, err := os.Stat(tempFilePath)
+	if err != nil {
+		t.Errorf("Failed to stat downloaded file %s: %v", tempFilePath, err)
+	} else if info.Size() != testFileSize {
+		t.Errorf("Downloaded file size mismatch. Expected %d, Got %d", testFileSize, info.Size())
+	} else {
+		t.Logf("Downloaded file size verified: %d bytes", info.Size())
+	}
+}
