@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -411,4 +412,167 @@ func TestWaitEvents(t *testing.T) {
 	}
 	// Check nothing happens if we fire the event with no listeners
 	m.waitEventsFire()
+}
+
+func TestLoginAnonymous(t *testing.T) {
+	m := New()
+	retry(t, "Anonymous Login", func() error {
+		return m.LoginAnonymous()
+	})
+
+	// Verify filesystem is initialized
+	if m.FS.root == nil {
+		t.Fatal("Root node is nil after anonymous login")
+	}
+
+	if m.FS.trash == nil {
+		t.Fatal("Trash node is nil after anonymous login")
+	}
+
+	// Try basic operation: create directory
+	node := createDir(t, m, "anonymousTest", m.FS.root)
+	if node == nil {
+		t.Fatal("Failed to create directory after anonymous login")
+	}
+
+	// Clean up
+	err := m.Delete(node, true)
+	if err != nil {
+		t.Logf("Warning: cleanup failed: %v", err)
+	}
+}
+
+func TestSharedFolderLink(t *testing.T) {
+	// Test parsing a shared folder link
+	link := "https://mega.nz/folder/ABcD1234#EFgh5678IjklMN0"
+	handle, key, err := GetSharedFolderInfo(link)
+	if err != nil {
+		t.Fatalf("Failed to parse shared folder link: %v", err)
+	}
+
+	if handle != "ABcD1234" {
+		t.Errorf("Wrong handle parsed from link, got %s, want ABcD1234", handle)
+	}
+
+	if key != "EFgh5678IjklMN0" {
+		t.Errorf("Wrong key parsed from link, got %s, want EFgh5678IjklMN0", key)
+	}
+
+	// Test with different format
+	link = "folder/ABcD1234#EFgh5678IjklMN0"
+	handle, key, err = GetSharedFolderInfo(link)
+	if err != nil {
+		t.Fatalf("Failed to parse shared folder link: %v", err)
+	}
+
+	if handle != "ABcD1234" {
+		t.Errorf("Wrong handle parsed from link, got %s, want ABcD1234", handle)
+	}
+
+	// Test with invalid format
+	_, _, err = GetSharedFolderInfo("invalid-link")
+	if err == nil {
+		t.Errorf("Expected error for invalid link format, got nil")
+	}
+
+	// Note: We don't test actual API access here to avoid dependency on external services
+	// and requiring valid links that might expire
+}
+
+func TestRealSharedFolder(t *testing.T) {
+	// Test with a real shared folder link
+	link := "mega.nz/folder/PAhFHS7T#a_9EPWjRFsVNAICwHrEFqA"
+
+	// Set timeout to be a bit longer since we're making network requests
+	timeout := 30 * time.Second
+
+	// Create a done channel to track test completion
+	done := make(chan bool)
+
+	// Run the test in a goroutine with timeout
+	go func() {
+		// Parse the link
+		handle, key, err := GetSharedFolderInfo(link)
+		if err != nil {
+			t.Errorf("Failed to parse shared folder link: %v", err)
+			done <- true
+			return
+		}
+
+		// Remove leading slash if present
+		handle = strings.TrimPrefix(handle, "/")
+
+		t.Logf("Parsed link - handle: %s, key: %s", handle, key)
+
+		// Create a new MEGA client with debugging
+		m := New()
+		m.SetLogger(t.Logf)
+		m.SetDebugger(t.Logf)
+
+		// Create a shared filesystem
+		fs, err := m.NewSharedFS(handle, key)
+		if err != nil {
+			t.Errorf("Failed to create shared filesystem: %v", err)
+			done <- true
+			return
+		}
+
+		// Get root node
+		root := fs.GetRoot()
+		if root == nil {
+			t.Errorf("Root node is nil")
+			done <- true
+			return
+		}
+
+		t.Logf("Successfully accessed shared folder: %s", root.GetName())
+
+		// Function to recursively print directory structure
+		var printDir func(node *Node, prefix string)
+		printDir = func(node *Node, prefix string) {
+			if node == nil {
+				return
+			}
+
+			// Get node type as string
+			nodeType := "File"
+			if node.GetType() == FOLDER {
+				nodeType = "Folder"
+			}
+
+			// Print node info
+			t.Logf("%s- %s (%s, Size: %d, Modified: %s)",
+				prefix,
+				node.GetName(),
+				nodeType,
+				node.GetSize(),
+				node.GetTimeStamp().Format(time.RFC3339))
+
+			// Get children
+			children, err := fs.GetChildren(node)
+			if err != nil {
+				t.Logf("%s  Error getting children: %v", prefix, err)
+				return
+			}
+
+			// Print children recursively
+			for _, child := range children {
+				printDir(child, prefix+"  ")
+			}
+		}
+
+		// Print directory structure
+		t.Logf("Directory structure:")
+		printDir(root, "")
+
+		done <- true
+	}()
+
+	// Wait for the test to complete or timeout
+	select {
+	case <-done:
+		// Test completed
+	case <-time.After(timeout):
+		t.Fatalf("Test timed out after %v", timeout)
+	}
 }

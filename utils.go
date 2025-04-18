@@ -374,3 +374,22 @@ func randString(l int) (string, error) {
 	d = d[:l]
 	return strings.NewReplacer("/", "A", "+", "B").Replace(string(d)), nil
 }
+
+// getAttrKey derives the attribute decryption key from a file key
+// This follows the XOR pattern used in the MEGA protocol
+func getAttrKey(fileKey []uint32) []uint32 {
+	if len(fileKey) >= 8 {
+		// Use XOR pattern for file keys: [0] ^ [4], [1] ^ [5], [2] ^ [6], [3] ^ [7]
+		return []uint32{
+			fileKey[0] ^ fileKey[4],
+			fileKey[1] ^ fileKey[5],
+			fileKey[2] ^ fileKey[6],
+			fileKey[3] ^ fileKey[7],
+		}
+	} else if len(fileKey) >= 4 {
+		// If we only have 4 elements, return them directly
+		return fileKey[:4]
+	}
+	// Return empty key if invalid
+	return []uint32{}
+}

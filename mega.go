@@ -2173,3 +2173,706 @@ func (m *Mega) Link(n *Node, includeKey bool) (string, error) {
 		return fmt.Sprintf("%v/#!%v", BASE_DOWNLOAD_URL, id), nil
 	}
 }
+
+// LoginAnonymous authenticates and starts a session with an anonymous temporary user
+func (m *Mega) LoginAnonymous() error {
+	m.debugf("Anonymous login")
+
+	// Generate random keys
+	masterKey := make([]uint32, 4)
+	passwordKey := make([]uint32, 4)
+	sessionChallenge := make([]uint32, 4)
+
+	for i := range masterKey {
+		masterKey[i] = uint32(mrand.Int31())
+		passwordKey[i] = uint32(mrand.Int31())
+		sessionChallenge[i] = uint32(mrand.Int31())
+	}
+
+	// Encrypt master key with password key
+	encryptedMasterKey, err := a32_to_base64([]uint32{
+		masterKey[0] ^ passwordKey[0],
+		masterKey[1] ^ passwordKey[1],
+		masterKey[2] ^ passwordKey[2],
+		masterKey[3] ^ passwordKey[3],
+	})
+	if err != nil {
+		return err
+	}
+
+	// Create challenge-response
+	challengeBytes, err := a32_to_bytes(sessionChallenge)
+	if err != nil {
+		return err
+	}
+
+	encryptedChallenge, err := a32_to_bytes([]uint32{
+		sessionChallenge[0] ^ masterKey[0],
+		sessionChallenge[1] ^ masterKey[1],
+		sessionChallenge[2] ^ masterKey[2],
+		sessionChallenge[3] ^ masterKey[3],
+	})
+	if err != nil {
+		return err
+	}
+
+	// Concatenate challenge and encrypted challenge
+	ts := base64urlencode(append(challengeBytes, encryptedChallenge...))
+
+	// Request user provisioning
+	var provisionMsg [1]struct {
+		Cmd string `json:"a"`
+		K   string `json:"k"`
+		TS  string `json:"ts"`
+	}
+
+	provisionMsg[0].Cmd = "up"
+	provisionMsg[0].K = encryptedMasterKey
+	provisionMsg[0].TS = ts
+
+	reqJson, err := json.Marshal(provisionMsg)
+	if err != nil {
+		return err
+	}
+
+	result, err := m.api_request(reqJson)
+	if err != nil {
+		return err
+	}
+
+	m.debugf("Anonymous provisioning response: %s", result)
+
+	// The response is an array with a single string
+	var userHandleArray []string
+	err = json.Unmarshal(result, &userHandleArray)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal user handle: %v, response: %s", err, result)
+	}
+
+	if len(userHandleArray) == 0 {
+		return errors.New("empty response from user provisioning")
+	}
+
+	userHandle := userHandleArray[0]
+	m.debugf("Got anonymous user handle: %s", userHandle)
+
+	// Now login with the user token
+	var msg [1]LoginMsg
+	var res [1]LoginResp
+
+	msg[0].Cmd = "us"
+	msg[0].User = userHandle
+
+	req, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+
+	result, err = m.api_request(req)
+	if err != nil {
+		return err
+	}
+
+	m.debugf("Anonymous login response: %s", result)
+
+	err = json.Unmarshal(result, &res)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal login response: %v, response: %s", err, result)
+	}
+
+	// Set master key
+	m.k = make([]byte, 16)
+	kbytes, err := a32_to_bytes(passwordKey)
+	if err != nil {
+		return err
+	}
+	copy(m.k, kbytes)
+
+	// Anonymous logins may have a different flow for session ID
+	// Check if we have the key directly instead
+	if res[0].K != "" {
+		// We have the key, decrypt it with password key to get master key
+		encKey, err := base64urldecode(res[0].K)
+		if err != nil {
+			return fmt.Errorf("failed to decode k: %v", err)
+		}
+
+		cipher, err := aes.NewCipher(m.k)
+		if err != nil {
+			return fmt.Errorf("failed to create cipher: %v", err)
+		}
+
+		cipher.Decrypt(encKey, encKey)
+		copy(m.k, encKey)
+
+		// For anonymous users, the session ID might be directly available
+		if res[0].Sid != "" {
+			m.sid = res[0].Sid
+		} else if res[0].Tsid != "" {
+			m.sid = res[0].Tsid
+		}
+	} else if res[0].Privk != "" && res[0].Csid != "" {
+		// Traditional flow with session ID decryption
+		m.sid, err = decryptSessionId(res[0].Privk, res[0].Csid, m.k)
+		if err != nil {
+			return fmt.Errorf("failed to decrypt session ID: %v", err)
+		}
+	} else {
+		// If we don't have either, try to find any session identifier
+		if res[0].Sid != "" {
+			m.sid = res[0].Sid
+		} else if res[0].Tsid != "" {
+			m.sid = res[0].Tsid
+		} else {
+			return fmt.Errorf("no session ID found in response")
+		}
+	}
+
+	if m.sid == "" {
+		return fmt.Errorf("failed to establish session ID")
+	}
+
+	m.debugf("Successfully established anonymous session with ID: %s", m.sid)
+
+	waitEvent := m.WaitEventsStart()
+
+	err = m.getFileSystem()
+	if err != nil {
+		return err
+	}
+
+	// Wait until all the pending events have been received
+	m.WaitEvents(waitEvent, 5*time.Second)
+
+	return nil
+}
+
+// NewSharedFS returns a filesystem referencing a shared folder link
+func (m *Mega) NewSharedFS(handle, key string) (*MegaFS, error) {
+	m.debugf("Creating new filesystem from shared folder with handle: %s", handle)
+
+	// Ensure handle doesn't have a leading slash
+	handle = strings.TrimPrefix(handle, "/")
+
+	// If not logged in, perform anonymous login
+	if m.sid == "" {
+		if err := m.LoginAnonymous(); err != nil {
+			return nil, err
+		}
+	}
+
+	// Decode key
+	shareKey, err := base64urldecode(key)
+	if err != nil {
+		return nil, err
+	}
+
+	// Store the share key for later use in decrypting file attributes
+	shareKeyUint32, err := bytes_to_a32(shareKey)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a new filesystem
+	fs := newMegaFS()
+
+	// Fetch the folder structure
+	var msg [1]ShareFolderMsg
+	msg[0].Cmd = "f"
+	msg[0].C = 1
+
+	// Create the API URL with the folder handle
+	url := fmt.Sprintf("%s/cs?id=%d", m.baseurl, m.sn)
+
+	if m.sid != "" {
+		url = fmt.Sprintf("%s&sid=%s", url, m.sid)
+	}
+
+	// Add the folder handle to the URL
+	url = fmt.Sprintf("%s&n=%s", url, handle)
+
+	// Send the request
+	req, err := json.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := m.client.Post(url, "application/json", bytes.NewBuffer(req))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, errors.New("HTTP status: " + resp.Status)
+	}
+
+	result, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse the response
+	var folderResp []FilesResp
+	err = json.Unmarshal(result, &folderResp)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(folderResp) == 0 || len(folderResp[0].F) == 0 {
+		return nil, errors.New("empty response for shared folder")
+	}
+
+	// Process the files
+	for _, f := range folderResp[0].F {
+		if f.T == 1 || f.T == 0 { // Folder or file
+			var n Node
+			n.name = f.Hash
+			n.hash = f.Hash
+			n.parent = nil
+			n.ntype = f.T
+			n.size = f.Sz
+			n.ts = time.Unix(f.Ts, 0)
+			n.fs = fs
+
+			// Create the node for the lookup map
+			fs.lookup[f.Hash] = &n
+
+			// Try to decrypt the attributes if possible
+			if f.Attr != "" {
+				// Extract key from 'k' field
+				if f.Key != "" {
+					parts := strings.Split(f.Key, ":")
+					if len(parts) == 2 {
+						encKey, err := base64_to_a32(parts[1])
+						if err != nil {
+							m.debugf("Error decoding key for file %s: %v", f.Hash, err)
+							continue
+						}
+
+						// Decrypt file key with share key
+						// We need to decrypt the key using AES-ECB mode with the share key
+						fileKey, err := decryptKey(encKey, shareKeyUint32)
+						if err != nil {
+							m.debugf("Error decrypting key for file %s: %v", f.Hash, err)
+							continue
+						}
+
+						// Get the proper attribute decryption key
+						attrKey := getAttrKey(fileKey)
+
+						// Convert attrKey uint32 slice to byte slice for decryptAttr
+						attrKeyBytes, err := a32_to_bytes(attrKey)
+						if err != nil {
+							m.debugf("Error converting key for file %s: %v", f.Hash, err)
+							continue
+						}
+
+						// Decrypt attributes
+						attr, err := decryptAttr(attrKeyBytes, f.Attr)
+						if err == nil {
+							// If we successfully decrypted attributes, update the node name
+							n.name = attr.Name
+							m.debugf("Successfully decrypted name for %s: %s", f.Hash, n.name)
+						} else {
+							m.debugf("Error decrypting attributes for file %s: %v", f.Hash, err)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Set up the tree structure
+	for _, f := range folderResp[0].F {
+		node, ok := fs.lookup[f.Hash]
+		if !ok {
+			continue
+		}
+
+		// If this node has a parent reference
+		if f.Parent != "" {
+			parent, ok := fs.lookup[f.Parent]
+			if ok {
+				node.parent = parent
+				parent.addChild(node)
+			}
+		} else {
+			// This is a root node
+			fs.root = node
+		}
+	}
+
+	// If no root was found, use the first root-level node
+	if fs.root == nil {
+		for _, n := range fs.lookup {
+			if n.parent == nil {
+				fs.root = n
+				break
+			}
+		}
+	}
+
+	return fs, nil
+}
+
+// decryptKey decrypts an encrypted key using the provided key
+func decryptKey(encKey, key []uint32) ([]uint32, error) {
+	result := make([]uint32, len(encKey))
+	for i := 0; i < len(encKey); i += 4 {
+		// For each block of 4 uint32 values
+		chunk := encKey[i:min(i+4, len(encKey))]
+		keyBytes, err := a32_to_bytes(key)
+		if err != nil {
+			return nil, err
+		}
+
+		// Create AES cipher
+		block, err := aes.NewCipher(keyBytes)
+		if err != nil {
+			return nil, err
+		}
+
+		// Decrypt the chunk
+		encChunkBytes, err := a32_to_bytes(chunk)
+		if err != nil {
+			return nil, err
+		}
+
+		decChunkBytes := make([]byte, len(encChunkBytes))
+		block.Decrypt(decChunkBytes, encChunkBytes)
+
+		// Convert back to uint32 slice
+		decChunk, err := bytes_to_a32(decChunkBytes)
+		if err != nil {
+			return nil, err
+		}
+
+		// Copy to result
+		copy(result[i:], decChunk)
+	}
+	return result, nil
+}
+
+// min returns the smaller of a and b
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// DownloadSharedFile downloads a file from a shared folder
+func (m *Mega) DownloadSharedFile(node *Node, folderHandle, folderKey, dstpath string, progress *chan int) error {
+	defer func() {
+		if progress != nil {
+			close(*progress)
+		}
+	}()
+
+	// If not logged in anonymously, we need to do so
+	if m.sid == "" {
+		err := m.LoginAnonymous()
+		if err != nil {
+			return fmt.Errorf("failed to login anonymously: %v", err)
+		}
+	}
+
+	// Request download URL for the file
+	var msg [1]ShareDownloadMsg
+	msg[0].Cmd = "g"
+	msg[0].G = 1
+	msg[0].V = 2
+	msg[0].SSL = 1
+	msg[0].N = node.hash
+
+	// Create the API URL with the folder handle
+	url := fmt.Sprintf("%s/cs?id=%d", m.baseurl, m.sn)
+
+	if m.sid != "" {
+		url = fmt.Sprintf("%s&sid=%s", url, m.sid)
+	}
+
+	// Add the folder handle to the URL
+	url = fmt.Sprintf("%s&n=%s", url, folderHandle)
+
+	// Send the request
+	req, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+
+	sleepTime := minSleepTime // initial backoff time
+	var resp *http.Response
+	var result []byte
+
+	for i := 0; i < m.retries+1; i++ {
+		if i != 0 {
+			m.debugf("Retry download request %d/%d: %v", i, m.retries, err)
+			backOffSleep(&sleepTime)
+		}
+
+		resp, err = m.client.Post(url, "application/json", bytes.NewBuffer(req))
+		if err != nil {
+			continue
+		}
+
+		if resp.StatusCode != 200 {
+			err = errors.New("Http Status: " + resp.Status)
+			_ = resp.Body.Close()
+			continue
+		}
+
+		result, err = io.ReadAll(resp.Body)
+		if err != nil {
+			_ = resp.Body.Close()
+			continue
+		}
+
+		err = resp.Body.Close()
+		if err != nil {
+			continue
+		}
+
+		break
+	}
+
+	if err != nil {
+		return err
+	}
+
+	// Parse the response
+	var dlRes [1]struct {
+		G    []string `json:"g"`  // Array of download URLs
+		Size int64    `json:"s"`  // File size
+		At   string   `json:"at"` // Encrypted attributes
+	}
+
+	err = json.Unmarshal(result, &dlRes)
+	if err != nil {
+		return fmt.Errorf("failed to parse download response: %v", err)
+	}
+
+	if len(dlRes[0].G) == 0 {
+		return errors.New("no download URLs available")
+	}
+
+	downloadURL := dlRes[0].G[0]
+	fileSize := dlRes[0].Size
+	encAttrs := dlRes[0].At
+
+	// Prepare for download
+	_, err = os.Stat(dstpath)
+	if os.IsExist(err) {
+		err = os.Remove(dstpath)
+		if err != nil {
+			return err
+		}
+	}
+
+	outfile, err := os.OpenFile(dstpath, os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return err
+	}
+	defer outfile.Close()
+
+	// Parse key
+	keyBytes, err := base64urldecode(folderKey)
+	if err != nil {
+		return fmt.Errorf("invalid key format: %v", err)
+	}
+
+	// Convert the key to uint32 array
+	key, err := bytes_to_a32(keyBytes)
+	if err != nil {
+		return err
+	}
+
+	// Use XOR pattern for file keys: [0] ^ [4], [1] ^ [5], [2] ^ [6], [3] ^ [7]
+	fileKey := []uint32{
+		key[0] ^ key[4],
+		key[1] ^ key[5],
+		key[2] ^ key[6],
+		key[3] ^ key[7],
+	}
+
+	// Convert file key to bytes
+	fileKeyBytes, err := a32_to_bytes(fileKey)
+	if err != nil {
+		return err
+	}
+
+	// Decrypt the attributes if needed
+	if node.name == "" || strings.HasPrefix(node.name, "ENCRYPTED_") || strings.HasPrefix(node.name, "UNNAMED_") {
+		attr, err := decryptAttr(fileKeyBytes, encAttrs)
+		if err == nil {
+			node.name = attr.Name
+		}
+	}
+
+	// Get chunk sizes
+	chunks := getChunkSizes(fileSize)
+
+	// Create AES cipher for decryption
+	aesBlock, err := aes.NewCipher(fileKeyBytes)
+	if err != nil {
+		return err
+	}
+
+	// Calculate nonce for CTR mode (IV) from file key - not directly used, but kept for completeness
+	// as it might be needed in future extensions for MAC verification
+	_, err = a32_to_bytes([]uint32{key[4], key[5], 0, 0})
+	if err != nil {
+		return err
+	}
+
+	// Set up worker pool for downloading chunks
+	workch := make(chan int)
+	errch := make(chan error, m.dl_workers)
+	wg := sync.WaitGroup{}
+
+	// Fire chunk download workers
+	for w := 0; w < m.dl_workers; w++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			// Wait for work blocked on channel
+			for id := range workch {
+				// Get chunk position and size
+				chunkStart := chunks[id].position
+				chunkSize := chunks[id].size
+
+				// Create URL for this chunk
+				chunkURL := fmt.Sprintf("%s/%d-%d", downloadURL, chunkStart, chunkStart+int64(chunkSize)-1)
+
+				// Download the chunk
+				var chunkResp *http.Response
+				sleepTime := minSleepTime
+				var chunkErr error
+				var chunk []byte
+
+				for retry := 0; retry < m.retries+1; retry++ {
+					chunkResp, chunkErr = m.client.Get(chunkURL)
+					if chunkErr == nil {
+						if chunkResp.StatusCode == 200 {
+							break
+						}
+						chunkErr = errors.New("Http Status: " + chunkResp.Status)
+						_ = chunkResp.Body.Close()
+					}
+					m.debugf("Retry download chunk %d/%d: %v", retry, m.retries, chunkErr)
+					backOffSleep(&sleepTime)
+				}
+
+				if chunkErr != nil {
+					errch <- chunkErr
+					return
+				}
+
+				// Read the chunk data
+				chunk, chunkErr = io.ReadAll(chunkResp.Body)
+				if chunkErr != nil {
+					_ = chunkResp.Body.Close()
+					errch <- chunkErr
+					return
+				}
+
+				chunkErr = chunkResp.Body.Close()
+				if chunkErr != nil {
+					errch <- chunkErr
+					return
+				}
+
+				if len(chunk) != chunkSize {
+					errch <- errors.New("wrong size for downloaded chunk")
+					return
+				}
+
+				// Decrypt the chunk
+				// Calculate CTR IV for this chunk
+				ctrIV := []uint32{key[4], key[5], uint32(uint64(chunkStart) / 0x1000000000), uint32(chunkStart / 0x10)}
+				ctrIVBytes, err := a32_to_bytes(ctrIV)
+				if err != nil {
+					errch <- err
+					return
+				}
+
+				// Create CTR mode cipher
+				ctrMode := cipher.NewCTR(aesBlock, ctrIVBytes)
+
+				// Decrypt the chunk
+				ctrMode.XORKeyStream(chunk, chunk)
+
+				// Write the chunk to file
+				_, chunkErr = outfile.WriteAt(chunk, chunkStart)
+				if chunkErr != nil {
+					errch <- chunkErr
+					return
+				}
+
+				// Report progress
+				if progress != nil {
+					*progress <- chunkSize
+				}
+			}
+		}()
+	}
+
+	// Place chunk download jobs to channel
+	err = nil
+	for id := 0; id < len(chunks) && err == nil; {
+		select {
+		case workch <- id:
+			id++
+		case err = <-errch:
+		}
+	}
+
+	close(workch)
+	wg.Wait()
+
+	if err != nil {
+		_ = os.Remove(dstpath)
+		return err
+	}
+
+	return nil
+}
+
+// GetSharedFolderInfo extracts handle and key from a MEGA folder link
+// Example link: https://mega.nz/folder/ABcD1234#EFgh5678IjklMN0
+func GetSharedFolderInfo(link string) (handle, key string, err error) {
+	// Clean the URL
+	link = strings.TrimSpace(link)
+
+	// Parse URL to remove protocol and domain if present
+	if strings.Contains(link, "://") {
+		parts := strings.Split(link, "/folder/")
+		if len(parts) < 2 {
+			return "", "", errors.New("invalid folder link format")
+		}
+		link = parts[1]
+	} else if strings.HasPrefix(link, "folder/") {
+		link = link[7:]
+	} else if strings.HasPrefix(link, "mega.nz/folder/") {
+		link = link[14:]
+	}
+
+	// Split the handle and key parts
+	parts := strings.Split(link, "#")
+	if len(parts) != 2 {
+		return "", "", errors.New("invalid folder link format: missing handle or key")
+	}
+
+	handle = strings.TrimPrefix(parts[0], "/")
+	key = parts[1]
+
+	// Basic validation
+	if handle == "" || key == "" {
+		return "", "", errors.New("empty handle or key")
+	}
+
+	return handle, key, nil
+}

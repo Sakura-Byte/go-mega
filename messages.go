@@ -28,6 +28,10 @@ type LoginResp struct {
 	Ach        int    `json:"ach"`
 	SessionKey string `json:"sek"`
 	U          string `json:"u"`
+	// Fields potentially returned for anonymous login
+	K    string `json:"k"`
+	Sid  string `json:"sid"`
+	Tsid string `json:"tsid"`
 }
 
 type UserMsg struct {
@@ -215,4 +219,22 @@ type Events struct {
 	W  string            `json:"w"`
 	Sn string            `json:"sn"`
 	E  []json.RawMessage `json:"a"`
+}
+
+// ShareFolderMsg is used to access a shared folder through a public link
+type ShareFolderMsg struct {
+	Cmd string `json:"a"`            // "f" for folder listing
+	C   int    `json:"c"`            // 1 to get contents
+	R   int    `json:"r,omitempty"`  // 1 for recursive
+	Ca  int    `json:"ca,omitempty"` // 1 for include creation attributes
+}
+
+// ShareDownloadMsg is used to get download information for a shared file
+type ShareDownloadMsg struct {
+	Cmd string `json:"a"`             // "g" for get
+	G   int    `json:"g,omitempty"`   // 1 to get a download link
+	V   int    `json:"v,omitempty"`   // version
+	SSL int    `json:"ssl,omitempty"` // use SSL
+	N   string `json:"n"`             // node handle
+	P   string `json:"p,omitempty"`   // parent handle for shared folders
 }
