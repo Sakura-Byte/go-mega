@@ -5,7 +5,10 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/sha512"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -493,10 +497,55 @@ func (m *Mega) api_request(r []byte) (buf []byte, err error) {
 			m.debugf("Retry API request %d/%d: %v", i, m.retries, err)
 			backOffSleep(&sleepTime)
 		}
-		resp, err = m.client.Post(url, "application/json", bytes.NewBuffer(r))
+
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(r))
 		if err != nil {
 			continue
 		}
+
+		resp, err = m.client.Do(req)
+		if err != nil {
+			continue
+		}
+
+		// Handle 402 Payment Required (Hashcash challenge)
+		if resp.StatusCode == 402 {
+			m.debugf("Received 402 Hashcash challenge")
+			hashcashHeader := resp.Header.Get("X-Hashcash")
+			_ = resp.Body.Close()
+
+			if hashcashHeader != "" {
+				parts := strings.Split(hashcashHeader, ":")
+				if len(parts) >= 4 {
+					x, err1 := strconv.Atoi(parts[0])
+					y, err2 := strconv.Atoi(parts[1])
+					token := parts[3]
+
+					if err1 == nil && err2 == nil && token != "" {
+						m.debugf("Hashcash challenge: x=%d, y=%d, token=%s", x, y, token)
+
+						// Generate cash
+						cash, err := m.gencash(token, y)
+						if err == nil {
+							newHashcash := fmt.Sprintf("1:%s:%s", token, cash)
+							m.debugf("Generated Hashcash solution: %s", newHashcash)
+
+							// Retry with hashcash header
+							req, err = http.NewRequest("POST", url, bytes.NewBuffer(r))
+							if err != nil {
+								continue
+							}
+							req.Header.Set("X-Hashcash", newHashcash)
+							resp, err = m.client.Do(req)
+							if err != nil {
+								continue
+							}
+						}
+					}
+				}
+			}
+		}
+
 		if resp.StatusCode != 200 {
 			// err must be not-nil on a continue
 			err = errors.New("Http Status: " + resp.Status)
@@ -541,6 +590,69 @@ func (m *Mega) api_request(r []byte) (buf []byte, err error) {
 	}
 
 	return nil, err
+}
+
+// ensureBase64Padding ensures the base64 string has proper padding
+func ensureBase64Padding(s string) string {
+	if len(s)%4 == 0 {
+		return s
+	}
+	return s + strings.Repeat("=", 4-len(s)%4)
+}
+
+// gencash generates a Hashcash token for the given token and easiness
+func (m *Mega) gencash(token string, easiness int) (string, error) {
+	// Ensure proper base64 padding and decode token
+	token = ensureBase64Padding(token)
+	tokenBytes, err := base64.URLEncoding.DecodeString(token)
+	if err != nil {
+		return "", err
+	}
+
+	if len(tokenBytes) != 48 {
+		return "", fmt.Errorf("token must decode to 48 bytes, got %d", len(tokenBytes))
+	}
+
+	// Compute threshold
+	threshold := (((easiness & 63) << 1) + 1) << (((easiness >> 6) * 7) + 3)
+
+	repeats := 262144
+	totalLen := 4 + repeats*48
+
+	// Initialize buffer with space for 4-byte prefix followed by copies of token
+	buffer := make([]byte, totalLen)
+
+	// Fill buffer after first 4 bytes with copies of token
+	for i := 0; i < repeats; i++ {
+		copy(buffer[4+i*48:], tokenBytes)
+	}
+
+	for {
+		// Increment the 4-byte prefix at the start of the buffer in little-endian order
+		carry := byte(1)
+		j := 0
+		for carry > 0 && j < 4 {
+			val := buffer[j] + carry
+			buffer[j] = val
+			carry = 0
+			if val == 0 {
+				carry = 1
+			}
+			j++
+		}
+
+		// Compute SHA-256 of the entire buffer
+		digest := sha256.Sum256(buffer)
+
+		// Interpret the first 4 bytes of the hash as a big-endian unsigned integer
+		firstUint32 := binary.BigEndian.Uint32(digest[0:4])
+
+		// Check against the threshold
+		if firstUint32 <= uint32(threshold) {
+			// Base64-encode the 4-byte prefix and return it
+			return base64.StdEncoding.EncodeToString(buffer[0:4]), nil
+		}
+	}
 }
 
 // prelogin call
