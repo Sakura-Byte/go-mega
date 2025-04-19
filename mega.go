@@ -15,6 +15,7 @@ import (
 	mrand "math/rand"
 	"net"
 	"net/http"
+	"net/url" // Import net/url
 	"os"
 	"path/filepath"
 	"strings"
@@ -475,76 +476,163 @@ func backOffSleep(pt *time.Duration) {
 	}
 }
 
-// API request method
-func (m *Mega) api_request(r []byte) (buf []byte, err error) {
+// api_request makes a request to the MEGA API server.
+// It handles retries, sequence numbers, session IDs, and basic error checking.
+//
+// Parameters:
+//   - r: The request body as bytes (typically JSON, but depends on contentType).
+//   - queryParams: Optional additional query parameters to add to the URL.
+//     Note: 'id' and 'sid' are handled automatically and should not be included here if skipSNIncrement is false.
+//   - contentType: Optional content type for the request. Defaults to "application/json".
+//   - skipSNIncrement: If true, don't increment the sequence number (m.sn) after the request. 'id' param will still be added based on current m.sn.
+func (m *Mega) api_request(r []byte, queryParams map[string]string, contentType string, skipSNIncrement bool) (buf []byte, err error) {
 	var resp *http.Response
-	// serialize the API requests
 	m.apiMu.Lock()
+	currentSN := m.sn // Capture current SN before potential increment
 	defer func() {
-		m.sn++
+		if !skipSNIncrement {
+			m.sn++
+		}
 		m.apiMu.Unlock()
 	}()
 
-	url := fmt.Sprintf("%s/cs?id=%d", m.baseurl, m.sn)
+	// Build URL
+	baseURL := fmt.Sprintf("%s/cs", m.baseurl)
+	urlValues := url.Values{}
+	urlValues.Set("id", fmt.Sprintf("%d", currentSN)) // Always include sequence number captured before lock
 
 	if m.sid != "" {
-		url = fmt.Sprintf("%s&sid=%s", url, m.sid)
+		urlValues.Set("sid", m.sid)
 	}
 
-	sleepTime := minSleepTime // inital backoff time
+	// Add custom query parameters
+	if queryParams != nil {
+		for k, v := range queryParams {
+			// Avoid overwriting id or sid if accidentally passed
+			if k != "id" && k != "sid" {
+				urlValues.Set(k, v)
+			} else {
+				m.debugf("api_request: skipping queryParam '%s' as it's automatically handled.", k)
+			}
+		}
+	}
+
+	fullURL := baseURL + "?" + urlValues.Encode()
+
+	// Determine Content-Type
+	finalContentType := "application/json" // Default
+	if contentType != "" {
+		finalContentType = contentType
+	}
+
+	sleepTime := minSleepTime // initial backoff time
 	for i := 0; i < m.retries+1; i++ {
 		if i != 0 {
-			m.debugf("Retry API request %d/%d: %v", i, m.retries, err)
+			m.debugf("Retry API request %d/%d to %s: %v", i, m.retries, fullURL, err)
 			backOffSleep(&sleepTime)
 		}
-		resp, err = m.client.Post(url, "application/json", bytes.NewBuffer(r))
+
+		postBody := bytes.NewBuffer(r)
+		if r == nil {
+			postBody = nil // Handle nil body for POST requests if necessary (though MEGA API usually expects a body)
+		}
+
+		resp, err = m.client.Post(fullURL, finalContentType, postBody)
 		if err != nil {
+			m.debugf("API POST error (attempt %d) to %s: %v", i+1, fullURL, err)
+			// Keep err for the next retry log
 			continue
 		}
+
+		// Use defer inside the loop to ensure Body.Close is called for each attempt
+		func() {
+			if resp != nil && resp.Body != nil {
+				defer resp.Body.Close()
+			}
+		}()
+
 		if resp.StatusCode != 200 {
-			// err must be not-nil on a continue
-			err = errors.New("Http Status: " + resp.Status)
-			_ = resp.Body.Close()
-			continue
-		}
-		buf, err = io.ReadAll(resp.Body)
-		if err != nil {
-			_ = resp.Body.Close()
-			continue
-		}
-		err = resp.Body.Close()
-		if err != nil {
-			continue
-		}
-
-		// at this point the body is read and closed
-
-		if bytes.HasPrefix(buf, []byte("[")) == false && bytes.HasPrefix(buf, []byte("-")) == false {
-			return nil, EBADRESP
-		}
-
-		if len(buf) < 6 {
-			var emsg [1]ErrorMsg
-			err = json.Unmarshal(buf, &emsg)
-			if err != nil {
-				err = json.Unmarshal(buf, &emsg[0])
+			// Read body to potentially include in error message
+			respBodyBytes, readErr := io.ReadAll(resp.Body)
+			if readErr != nil {
+				m.debugf("API ReadAll error after non-200 status %d (attempt %d) from %s: %v", resp.StatusCode, i+1, fullURL, readErr)
+				// Use the original status error if reading fails
+				err = fmt.Errorf("http status %s", resp.Status)
+			} else {
+				// Try to parse MEGA API error from body (numeric or array)
+				var apiErrCode int
+				var apiErrArray []ErrorMsg
+				if json.Unmarshal(respBodyBytes, &apiErrCode) == nil {
+					err = parseError(ErrorMsg(apiErrCode))
+				} else if json.Unmarshal(respBodyBytes, &apiErrArray) == nil && len(apiErrArray) > 0 {
+					err = parseError(apiErrArray[0])
+				} else {
+					// Use status and body as error if not a standard API error
+					err = fmt.Errorf("http status %s: %s", resp.Status, string(respBodyBytes))
+				}
 			}
-			if err != nil {
-				return buf, EBADRESP
-			}
-			err = parseError(emsg[0])
-			if err == EAGAIN {
+			m.debugf("API non-200 response (attempt %d) from %s: %v", i+1, fullURL, err)
+			// Check for EAGAIN specifically for retrying
+			if errors.Is(err, EAGAIN) {
+				m.debugf("API got EAGAIN (attempt %d) from %s, retrying...", i+1, fullURL)
+				// err is EAGAIN, loop continues
 				continue
 			}
-			return buf, err
+			// Don't retry on other fatal errors immediately, let the loop handle retries based on count
+			// Keep the err for the next retry log or final return
+			continue
 		}
 
-		if err == nil {
-			return buf, nil
+		// Status code is 200
+		buf, err = io.ReadAll(resp.Body)
+		if err != nil {
+			m.debugf("API ReadAll error on 200 OK (attempt %d) from %s: %v", i+1, fullURL, err)
+			// err will be non-nil, loop will continue
+			continue
 		}
+
+		// Success path: Body read successfully
+		m.debugf("API request successful (attempt %d) to %s", i+1, fullURL)
+
+		// Basic validation, can be improved
+		// Mega responses are typically JSON arrays, JSON objects, or numeric error codes
+		trimmedResp := bytes.TrimSpace(buf)
+		if !(bytes.HasPrefix(trimmedResp, []byte("[")) || bytes.HasPrefix(trimmedResp, []byte("{")) || (bytes.HasPrefix(trimmedResp, []byte("-")) && len(trimmedResp) < 5)) {
+			err = fmt.Errorf("%w: unexpected response format starting with %q", EBADRESP, string(trimmedResp[:min(10, len(trimmedResp))]))
+			m.debugf("API Bad Response (attempt %d) from %s: %v", i+1, fullURL, err)
+			// Treat as potentially transient, let loop retry
+			continue
+		}
+
+		// Check for numerical error codes explicitly within the successful response body (e.g., -3 for EAGAIN)
+		var apiErrCode int
+		if errUnmarshal := json.Unmarshal(trimmedResp, &apiErrCode); errUnmarshal == nil && apiErrCode < 0 {
+			parsedErr := parseError(ErrorMsg(apiErrCode))
+			if errors.Is(parsedErr, EAGAIN) {
+				m.debugf("API response is EAGAIN code %d (attempt %d) from %s, retrying...", apiErrCode, i+1, fullURL)
+				err = parsedErr // Set err to EAGAIN for the retry message
+				continue        // Retry on EAGAIN
+			}
+			// If it's another numerical error, return it
+			if parsedErr != nil {
+				return buf, parsedErr
+			}
+		}
+
+		// If we reached here, the request was successful and response looks okay
+		return buf, nil
 	}
 
-	return nil, err
+	// If loop finishes, return the last error encountered
+	if err == nil { // Should not happen if loop finished, but safeguard
+		err = errors.New("api request failed after max retries without a specific error")
+	}
+	return nil, fmt.Errorf("api request failed after %d attempts: %w", m.retries+1, err)
+}
+
+// Convenience wrapper for standard JSON api_request calls
+func (m *Mega) api_request_json(r []byte) (buf []byte, err error) {
+	return m.api_request(r, nil, "", false)
 }
 
 // prelogin call
@@ -561,7 +649,7 @@ func (m *Mega) prelogin(email string) error {
 	if err != nil {
 		return err
 	}
-	result, err := m.api_request(req)
+	result, err := m.api_request_json(req)
 	if err != nil {
 		return err
 	}
@@ -634,7 +722,7 @@ func (m *Mega) login(email string, passwd string, multiFactor string) error {
 	if err != nil {
 		return err
 	}
-	result, err = m.api_request(req)
+	result, err = m.api_request_json(req)
 	if err != nil {
 		return err
 	}
@@ -745,7 +833,7 @@ func (m *Mega) GetUser() (UserResp, error) {
 	if err != nil {
 		return res[0], err
 	}
-	result, err := m.api_request(req)
+	result, err := m.api_request_json(req)
 	if err != nil {
 		return res[0], err
 	}
@@ -767,7 +855,7 @@ func (m *Mega) GetQuota() (QuotaResp, error) {
 	if err != nil {
 		return res[0], err
 	}
-	result, err := m.api_request(req)
+	result, err := m.api_request_json(req)
 	if err != nil {
 		return res[0], err
 	}
@@ -816,7 +904,7 @@ func (m *Mega) addFSNode(itm FSNode) (*Node, error) {
 			if err != nil {
 				return nil, err
 			}
-			// Shared folder
+		// Shared folder
 		case itm.SUser != "" && itm.SKey != "":
 			sk, err := base64urldecode(itm.SKey)
 			if err != nil {
@@ -844,7 +932,7 @@ func (m *Mega) addFSNode(itm FSNode) (*Node, error) {
 			if err != nil {
 				return nil, err
 			}
-			// Shared file
+		// Shared file
 		default:
 			k, ok := m.FS.skmap[itemUser]
 			if !ok {
@@ -1003,7 +1091,7 @@ func (m *Mega) getFileSystem() error {
 	if err != nil {
 		return err
 	}
-	result, err := m.api_request(req)
+	result, err := m.api_request_json(req)
 	if err != nil {
 		return err
 	}
@@ -1060,243 +1148,122 @@ func (m *Mega) NewDownload(src *Node) (*Download, error) {
 		return nil, EARGS
 	}
 
+	// Check if this is a shared folder context
+	// A node is considered shared if it belongs to a MegaFS instance
+	// that was specifically created for a shared folder (has a folderHandle).
+	isShared := src.fs != nil && src.fs.folderHandle != ""
+
+	if isShared {
+		// Get folder handle and key from the node's filesystem context
+		if src.fs == nil { // Should not happen if isShared is true, but check anyway
+			return nil, fmt.Errorf("shared node %s has nil filesystem context despite being marked shared", src.hash)
+		}
+
+		src.fs.mutex.Lock() // Lock the node's specific FS
+		fsFolderHandle := src.fs.folderHandle
+
+		// Convert folder key to base64 string for DownloadSharedFile
+		fsFolderKeyBytes, err := a32_to_bytes(src.fs.folderKey)
+		src.fs.mutex.Unlock()
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert folder key: %w", err)
+		}
+
+		fsFolderKeyStr := base64urlencode(fsFolderKeyBytes)
+
+		if fsFolderHandle == "" {
+			m.logf("Warning: Shared node %s has an empty folderHandle in its fs context.", src.hash)
+			return nil, fmt.Errorf("shared node %s filesystem context has empty folder handle", src.hash)
+		}
+
+		m.debugf("NewDownload delegating to DownloadSharedFile for node %s (handle: %s)", src.hash, fsFolderHandle)
+
+		// Use DownloadSharedFile to create the download object
+		return m.DownloadSharedFile(src, fsFolderHandle, fsFolderKeyStr, nil)
+	}
+
+	// Standard download logic for non-shared files
 	var msg [1]DownloadMsg
 	var res [1]DownloadResp
 
-	// Check if this is a shared folder context
-	isShared := src.isShared
-	var fsFolderHandle string
-	var fsFolderKey []uint32
-	if isShared {
-		m.FS.mutex.Lock()
-		fsFolderHandle = m.FS.folderHandle
-		fsFolderKey = m.FS.folderKey
-		m.FS.mutex.Unlock()
-		m.debugf("NewDownload called in shared context for node %s (handle: %s)", src.hash, fsFolderHandle)
-	} else {
-		m.debugf("NewDownload called in standard context for node %s", src.hash)
+	m.debugf("NewDownload called in standard context for node %s", src.hash)
+	m.FS.mutex.Lock()
+	msg[0].Cmd = "g"
+	msg[0].G = 1
+	msg[0].N = src.hash
+	if m.config.https {
+		msg[0].SSL = 2
 	}
 
-	var fileKeyBytes []byte
+	var keyBytes []byte
+	// Use key from node metadata if available
+	if len(src.meta.key) > 0 {
+		keyBytes = src.meta.key
+	} else {
+		m.logf("Warning: Missing meta.key for non-shared node %s", src.hash)
+		m.FS.mutex.Unlock()
+		return nil, fmt.Errorf("missing decryption key for node %s", src.hash)
+	}
+
+	// Derive IV from node metadata if available
 	var ivBytes []byte
-	var downloadUrl string
-	var fileSize int64
-	var err error
-
-	if isShared {
-		// Logic adapted from DownloadSharedFile for shared link download setup
-		m.debugf("NewDownload called in shared context for node %s (handle: %s)", src.hash, fsFolderHandle)
-		var sharedMsg [1]struct {
-			Cmd string `json:"a"`
-			G   int    `json:"g"`
-			V   int    `json:"v"`
-			SSL int    `json:"ssl"`
-			N   string `json:"n"`
-		}
-		sharedMsg[0].Cmd = "g"
-		sharedMsg[0].G = 1
-		sharedMsg[0].V = 2 // Use v2 for shared downloads
-		if m.config.https {
-			sharedMsg[0].SSL = 1
-		} else {
-			sharedMsg[0].SSL = 0
-		}
-		sharedMsg[0].N = src.hash
-
-		// Create the API URL with the folder handle
-		// Use a temporary sequence number for this request, separate from main api_request sequence
-		tempSn := m.sn + 1000 // Use an offset to avoid collision, though not strictly necessary with separate call
-		url := fmt.Sprintf("%s/cs?id=%d", m.baseurl, tempSn)
-		if m.sid != "" {
-			url = fmt.Sprintf("%s&sid=%s", url, m.sid)
-		}
-		url = fmt.Sprintf("%s&n=%s", url, fsFolderHandle)
-
-		request, err := json.Marshal(sharedMsg)
+	if len(src.meta.iv) > 0 {
+		t, err := bytes_to_a32(src.meta.iv)
 		if err != nil {
-			return nil, err
+			m.FS.mutex.Unlock()
+			return nil, fmt.Errorf("failed to parse IV for node %s: %w", src.hash, err)
 		}
-
-		// Perform the API request directly, without using the main api_request method
-		// to avoid global mutex and sequence number increment issues within download setup.
-		var sharedResult []byte
-		sleepTime := minSleepTime
-		for i := 0; i < m.retries+1; i++ {
-			if i != 0 {
-				m.debugf("Retry shared download API request %d/%d for node %s: %v", i, m.retries, src.hash, err)
-				backOffSleep(&sleepTime)
-			}
-			sharedResp, postErr := m.client.Post(url, "application/json", bytes.NewBuffer(request))
-			if postErr != nil {
-				m.debugf("Shared download API POST error (attempt %d): %v", i+1, postErr)
-				err = postErr // Store the last error
-				continue
-			}
-
-			sharedResult, readErr := io.ReadAll(sharedResp.Body)
-			bodyCloseErr := sharedResp.Body.Close()
-			if readErr != nil { // Prioritize read error
-				m.debugf("Shared download API ReadAll error (attempt %d): %v", i+1, readErr)
-				err = readErr // Store the last error
-				continue
-			}
-			if bodyCloseErr != nil { // Log close error if it happens
-				m.debugf("Shared download API Body.Close error (attempt %d): %v", i+1, bodyCloseErr)
-				// Potentially continue or return based on severity, for now continue
-			}
-
-			if sharedResp.StatusCode != 200 {
-				// Try to parse error from body
-				var apiErr []ErrorMsg
-				if json.Unmarshal(sharedResult, &apiErr) == nil && len(apiErr) > 0 {
-					err = parseError(apiErr[0])
-				} else {
-					err = fmt.Errorf("http status %s: %s", sharedResp.Status, string(sharedResult))
-				}
-
-				if err == EAGAIN { // Check for EAGAIN specifically for retrying
-					m.debugf("Shared download API got EAGAIN (attempt %d), retrying...", i+1)
-					continue
-				}
-				m.debugf("Shared download API non-200 status (attempt %d): %v", i+1, err)
-				continue // Continue retrying on other non-200 errors for now
-			}
-
-			// Success
-			m.debugf("Shared download API request successful for node %s (attempt %d)", src.hash, i+1)
-			err = nil // Clear error on success
-			break
-		}
-		if err != nil { // If loop finishes with an error
-			return nil, fmt.Errorf("failed shared download API request after %d attempts for node %s: %w", m.retries+1, src.hash, err)
-		}
-
-		// Parse the shared download response
-		var dlRes [1]struct {
-			G    []string `json:"g"`  // Array of download URLs
-			Size int64    `json:"s"`  // File size
-			At   string   `json:"at"` // Encrypted attributes
-		}
-		err = json.Unmarshal(sharedResult, &dlRes)
+		// Standard IV calculation
+		ivBytes, err = a32_to_bytes([]uint32{t[0], t[1], t[0], t[1]})
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse shared download response: %w, response: %s", err, sharedResult)
+			m.FS.mutex.Unlock()
+			return nil, fmt.Errorf("failed to convert IV for node %s: %w", src.hash, err)
 		}
-
-		if len(dlRes[0].G) == 0 {
-			return nil, errors.New("no download URLs available in shared download response")
-		}
-
-		downloadUrl = dlRes[0].G[0]
-		fileSize = dlRes[0].Size
-
-		// Derive file key and IV from the stored folderKey
-		key := fsFolderKey // Use the key stored in FS
-		if len(key) < 8 {
-			return nil, fmt.Errorf("invalid shared folder key length: %d", len(key))
-		}
-		fileKey := []uint32{
-			key[0] ^ key[4],
-			key[1] ^ key[5],
-			key[2] ^ key[6],
-			key[3] ^ key[7],
-		}
-		fileKeyBytes, err = a32_to_bytes(fileKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to convert shared file key: %w", err)
-		}
-		// Use IV derived from shared folder key components
-		ivBytes, err = a32_to_bytes([]uint32{key[4], key[5], key[4], key[5]})
-		if err != nil {
-			return nil, fmt.Errorf("failed to convert shared file IV: %w", err)
-		}
-
-		// Decrypt attributes if possible (best effort)
-		if dlRes[0].At != "" {
-			_, errAttr := decryptAttr(fileKeyBytes, dlRes[0].At)
-			if errAttr != nil {
-				m.debugf("Failed to decrypt attributes for shared node %s: %v", src.hash, errAttr)
-			}
-			// Ignore error, name might already be set correctly from NewSharedFS
-		}
-
 	} else {
-		// Standard download logic for non-shared files
-		m.debugf("NewDownload called in standard context for node %s", src.hash)
-		m.FS.mutex.Lock()
-		msg[0].Cmd = "g"
-		msg[0].G = 1
-		msg[0].N = src.hash
-		if m.config.https {
-			msg[0].SSL = 2
-		}
-
-		var keyBytes []byte
-		// Use key from node metadata if available
-		if len(src.meta.key) > 0 {
-			keyBytes = src.meta.key
-		} else {
-			m.logf("Warning: Missing meta.key for non-shared node %s", src.hash)
-			m.FS.mutex.Unlock()
-			return nil, fmt.Errorf("missing decryption key for node %s", src.hash)
-		}
-
-		// Derive IV from node metadata if available
-		if len(src.meta.iv) > 0 {
-			t, err := bytes_to_a32(src.meta.iv)
-			if err != nil {
-				m.FS.mutex.Unlock()
-				return nil, fmt.Errorf("failed to parse IV for node %s: %w", src.hash, err)
-			}
-			// Standard IV calculation
-			ivBytes, err = a32_to_bytes([]uint32{t[0], t[1], t[0], t[1]})
-			if err != nil {
-				m.FS.mutex.Unlock()
-				return nil, fmt.Errorf("failed to convert IV for node %s: %w", src.hash, err)
-			}
-		} else {
-			m.logf("Warning: Missing meta.iv for non-shared node %s", src.hash)
-			m.FS.mutex.Unlock()
-			return nil, fmt.Errorf("missing IV for node %s", src.hash)
-		}
+		m.logf("Warning: Missing meta.iv for non-shared node %s", src.hash)
 		m.FS.mutex.Unlock()
-
-		request, err := json.Marshal(msg)
-		if err != nil {
-			return nil, err
-		}
-		result, err := m.api_request(request) // Use standard API request for regular files
-		if err != nil {
-			return nil, err // Error includes API error parsing already
-		}
-
-		err = json.Unmarshal(result, &res)
-		if err != nil {
-			// Attempt to parse as error if unmarshal fails
-			var apiErr []ErrorMsg
-			if json.Unmarshal(result, &apiErr) == nil && len(apiErr) > 0 {
-				return nil, parseError(apiErr[0])
-			}
-			return nil, fmt.Errorf("failed to parse standard download response: %w, response: %s", err, result)
-		}
-
-		// DownloadResp has an embedded error in it for some reason
-		if res[0].Err != 0 {
-			return nil, parseError(res[0].Err)
-		}
-
-		// Decrypt attributes using the node's key
-		_, err = decryptAttr(keyBytes, res[0].Attr)
-		if err != nil {
-			return nil, err
-		}
-		downloadUrl = res[0].G
-		fileSize = int64(res[0].Size)
+		return nil, fmt.Errorf("missing IV for node %s", src.hash)
 	}
+	m.FS.mutex.Unlock()
+
+	request, err := json.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+	result, err := m.api_request_json(request) // Use standard API request for regular files
+	if err != nil {
+		return nil, err // Error includes API error parsing already
+	}
+
+	err = json.Unmarshal(result, &res)
+	if err != nil {
+		// Attempt to parse as error if unmarshal fails
+		var apiErr []ErrorMsg
+		if json.Unmarshal(result, &apiErr) == nil && len(apiErr) > 0 {
+			return nil, parseError(apiErr[0])
+		}
+		return nil, fmt.Errorf("failed to parse standard download response: %w, response: %s", err, result)
+	}
+
+	// DownloadResp has an embedded error in it for some reason
+	if res[0].Err != 0 {
+		return nil, parseError(res[0].Err)
+	}
+
+	// Decrypt attributes using the node's key
+	_, err = decryptAttr(keyBytes, res[0].Attr)
+	if err != nil {
+		return nil, err
+	}
+
+	downloadUrl := res[0].G
+	fileSize := int64(res[0].Size)
 
 	// Common download setup
 	chunks := getChunkSizes(fileSize)
 
-	aes_block, err := aes.NewCipher(fileKeyBytes)
+	aes_block, err := aes.NewCipher(keyBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -1316,8 +1283,9 @@ func (m *Mega) NewDownload(src *Node) (*Download, error) {
 		mac_enc:     mac_enc,
 		chunks:      chunks,
 		chunk_macs:  make([][]byte, len(chunks)),
-		isShared:    isShared, // Set flag to indicate shared context
+		isShared:    false, // Not a shared download
 	}
+
 	// IPv6 initialization (only once per download)
 	if m.ipv6CIDR != nil {
 		ip, err := generateRandomIPv6(m.ipv6CIDR)
@@ -1331,18 +1299,16 @@ func (m *Mega) NewDownload(src *Node) (*Download, error) {
 						},
 					}).DialContext,
 				},
-				Timeout: m.client.Timeout, // Use the main client's timeout
+				Timeout: m.timeout,
 			}
-			m.debugf("Using IPv6 %s for download of %s", ip.String(), src.name)
-		} else {
-			m.debugf("Failed to generate random IPv6, falling back to default client for %s: %v", src.name, err)
-			d.client = m.client // Fallback
 		}
 	}
-	// Fallback to default client if IPv6 not configured or failed
+
+	// Use the global client if no specific client is set
 	if d.client == nil {
 		d.client = m.client
 	}
+
 	return d, nil
 }
 
@@ -1615,7 +1581,7 @@ func (m *Mega) NewUpload(parent *Node, name string, fileSize int64) (*Upload, er
 	if err != nil {
 		return nil, err
 	}
-	result, err := m.api_request(request)
+	result, err := m.api_request_json(request)
 	if err != nil {
 		return nil, err
 	}
@@ -1835,7 +1801,7 @@ func (u *Upload) Finish() (node *Node, err error) {
 	if err != nil {
 		return nil, err
 	}
-	result, err := u.m.api_request(request)
+	result, err := u.m.api_request_json(request)
 	if err != nil {
 		return nil, err
 	}
@@ -1971,7 +1937,7 @@ func (m *Mega) Move(src *Node, parent *Node) error {
 	if err != nil {
 		return err
 	}
-	_, err = m.api_request(request)
+	_, err = m.api_request_json(request)
 	if err != nil {
 		return err
 	}
@@ -2024,7 +1990,7 @@ func (m *Mega) Rename(src *Node, name string) error {
 	if err != nil {
 		return err
 	}
-	_, err = m.api_request(req)
+	_, err = m.api_request_json(req)
 	if err != nil {
 		return err
 	}
@@ -2084,7 +2050,7 @@ func (m *Mega) CreateDir(name string, parent *Node) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	result, err := m.api_request(req)
+	result, err := m.api_request_json(req)
 	if err != nil {
 		return nil, err
 	}
@@ -2123,7 +2089,7 @@ func (m *Mega) Delete(node *Node, destroy bool) error {
 	if err != nil {
 		return err
 	}
-	_, err = m.api_request(req)
+	_, err = m.api_request_json(req)
 	if err != nil {
 		return err
 	}
@@ -2348,7 +2314,7 @@ func (m *Mega) getLink(n *Node) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	result, err := m.api_request(req)
+	result, err := m.api_request_json(req)
 	if err != nil {
 		return "", err
 	}
@@ -2436,7 +2402,7 @@ func (m *Mega) LoginAnonymous() error {
 		return err
 	}
 
-	result, err := m.api_request(reqJson)
+	result, err := m.api_request_json(reqJson)
 	if err != nil {
 		return err
 	}
@@ -2469,7 +2435,7 @@ func (m *Mega) LoginAnonymous() error {
 		return err
 	}
 
-	result, err = m.api_request(req)
+	result, err = m.api_request_json(req)
 	if err != nil {
 		return err
 	}
@@ -2767,18 +2733,12 @@ func min(a, b int) int {
 }
 
 // DownloadSharedFile downloads a file from a shared folder
-func (m *Mega) DownloadSharedFile(node *Node, folderHandle, folderKey, dstpath string, progress *chan int) error {
-	defer func() {
-		if progress != nil {
-			close(*progress)
-		}
-	}()
-
+func (m *Mega) DownloadSharedFile(node *Node, folderHandle, folderKey string, progress *chan int) (*Download, error) {
 	// If not logged in anonymously, we need to do so
 	if m.sid == "" {
 		err := m.LoginAnonymous()
 		if err != nil {
-			return fmt.Errorf("failed to login anonymously: %v", err)
+			return nil, fmt.Errorf("failed to login anonymously: %v", err)
 		}
 	}
 
@@ -2803,7 +2763,7 @@ func (m *Mega) DownloadSharedFile(node *Node, folderHandle, folderKey, dstpath s
 	// Send the request
 	req, err := json.Marshal(msg)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	sleepTime := minSleepTime // initial backoff time
@@ -2816,7 +2776,7 @@ func (m *Mega) DownloadSharedFile(node *Node, folderHandle, folderKey, dstpath s
 			backOffSleep(&sleepTime)
 		}
 
-		resp, err = m.client.Post(url, "application/json", bytes.NewBuffer(req))
+		resp, err = m.client.Post(url, "text/plain;charset=UTF-8", bytes.NewBuffer(req))
 		if err != nil {
 			continue
 		}
@@ -2842,54 +2802,41 @@ func (m *Mega) DownloadSharedFile(node *Node, folderHandle, folderKey, dstpath s
 	}
 
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Parse the response
 	var dlRes [1]struct {
-		G    []string `json:"g"`  // Array of download URLs
-		Size int64    `json:"s"`  // File size
-		At   string   `json:"at"` // Encrypted attributes
+		G    []string `json:"g"`             // Array of download URLs
+		Size int64    `json:"s"`             // File size
+		At   string   `json:"at"`            // Encrypted attributes
+		Msd  int      `json:"msd,omitempty"` // Added based on browser req
+		Fa   string   `json:"fa,omitempty"`  // Added based on browser req
 	}
 
 	err = json.Unmarshal(result, &dlRes)
 	if err != nil {
-		return fmt.Errorf("failed to parse download response: %v", err)
+		return nil, fmt.Errorf("failed to parse download response: %v", err)
 	}
 
 	if len(dlRes[0].G) == 0 {
-		return errors.New("no download URLs available")
+		return nil, errors.New("no download URLs available")
 	}
 
 	downloadURL := dlRes[0].G[0]
 	fileSize := dlRes[0].Size
 	encAttrs := dlRes[0].At
 
-	// Prepare for download
-	_, err = os.Stat(dstpath)
-	if os.IsExist(err) {
-		err = os.Remove(dstpath)
-		if err != nil {
-			return err
-		}
-	}
-
-	outfile, err := os.OpenFile(dstpath, os.O_RDWR|os.O_CREATE, 0600)
-	if err != nil {
-		return err
-	}
-	defer outfile.Close()
-
 	// Parse key
 	keyBytes, err := base64urldecode(folderKey)
 	if err != nil {
-		return fmt.Errorf("invalid key format: %v", err)
+		return nil, fmt.Errorf("invalid key format: %v", err)
 	}
 
 	// Convert the key to uint32 array
 	key, err := bytes_to_a32(keyBytes)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Use XOR pattern for file keys: [0] ^ [4], [1] ^ [5], [2] ^ [6], [3] ^ [7]
@@ -2903,7 +2850,7 @@ func (m *Mega) DownloadSharedFile(node *Node, folderHandle, folderKey, dstpath s
 	// Convert file key to bytes
 	fileKeyBytes, err := a32_to_bytes(fileKey)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Decrypt the attributes if needed
@@ -2920,129 +2867,58 @@ func (m *Mega) DownloadSharedFile(node *Node, folderHandle, folderKey, dstpath s
 	// Create AES cipher for decryption
 	aesBlock, err := aes.NewCipher(fileKeyBytes)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// Calculate nonce for CTR mode (IV) from file key - not directly used, but kept for completeness
-	// as it might be needed in future extensions for MAC verification
-	_, err = a32_to_bytes([]uint32{key[4], key[5], 0, 0})
+	// Calculate nonce for CTR mode (IV)
+	ivBytes, err := a32_to_bytes([]uint32{key[4], key[5], key[4], key[5]})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// Set up worker pool for downloading chunks
-	workch := make(chan int)
-	errch := make(chan error, m.dl_workers)
-	wg := sync.WaitGroup{}
+	mac_enc := cipher.NewCBCEncrypter(aesBlock, zero_iv)
 
-	// Fire chunk download workers
-	for w := 0; w < m.dl_workers; w++ {
-		wg.Add(1)
+	if m.config.https && strings.HasPrefix(downloadURL, "http://") {
+		downloadURL = "https://" + strings.TrimPrefix(downloadURL, "http://")
+	}
 
-		go func() {
-			defer wg.Done()
+	// Create Download object
+	d := &Download{
+		m:           m,
+		src:         node,
+		resourceUrl: downloadURL,
+		aes_block:   aesBlock,
+		iv:          ivBytes,
+		mac_enc:     mac_enc,
+		chunks:      chunks,
+		chunk_macs:  make([][]byte, len(chunks)),
+		isShared:    true, // This is a shared file download
+	}
 
-			// Wait for work blocked on channel
-			for id := range workch {
-				// Get chunk position and size
-				chunkStart := chunks[id].position
-				chunkSize := chunks[id].size
-
-				// Create URL for this chunk
-				chunkURL := fmt.Sprintf("%s/%d-%d", downloadURL, chunkStart, chunkStart+int64(chunkSize)-1)
-
-				// Download the chunk
-				var chunkResp *http.Response
-				sleepTime := minSleepTime
-				var chunkErr error
-				var chunk []byte
-
-				for retry := 0; retry < m.retries+1; retry++ {
-					chunkResp, chunkErr = m.client.Get(chunkURL)
-					if chunkErr == nil {
-						if chunkResp.StatusCode == 200 {
-							break
-						}
-						chunkErr = errors.New("Http Status: " + chunkResp.Status)
-						_ = chunkResp.Body.Close()
-					}
-					m.debugf("Retry download chunk %d/%d: %v", retry, m.retries, chunkErr)
-					backOffSleep(&sleepTime)
-				}
-
-				if chunkErr != nil {
-					errch <- chunkErr
-					return
-				}
-
-				// Read the chunk data
-				chunk, chunkErr = io.ReadAll(chunkResp.Body)
-				if chunkErr != nil {
-					_ = chunkResp.Body.Close()
-					errch <- chunkErr
-					return
-				}
-
-				chunkErr = chunkResp.Body.Close()
-				if chunkErr != nil {
-					errch <- chunkErr
-					return
-				}
-
-				if len(chunk) != chunkSize {
-					errch <- errors.New("wrong size for downloaded chunk")
-					return
-				}
-
-				// Decrypt the chunk
-				// Calculate CTR IV for this chunk
-				ctrIV := []uint32{key[4], key[5], uint32(uint64(chunkStart) / 0x1000000000), uint32(chunkStart / 0x10)}
-				ctrIVBytes, err := a32_to_bytes(ctrIV)
-				if err != nil {
-					errch <- err
-					return
-				}
-
-				// Create CTR mode cipher
-				ctrMode := cipher.NewCTR(aesBlock, ctrIVBytes)
-
-				// Decrypt the chunk
-				ctrMode.XORKeyStream(chunk, chunk)
-
-				// Write the chunk to file
-				_, chunkErr = outfile.WriteAt(chunk, chunkStart)
-				if chunkErr != nil {
-					errch <- chunkErr
-					return
-				}
-
-				// Report progress
-				if progress != nil {
-					*progress <- chunkSize
-				}
+	// IPv6 initialization (only once per download)
+	if m.ipv6CIDR != nil {
+		ip, err := generateRandomIPv6(m.ipv6CIDR)
+		if err == nil {
+			d.client = &http.Client{
+				Transport: &http.Transport{
+					DialContext: (&net.Dialer{
+						LocalAddr: &net.TCPAddr{
+							IP:   ip,
+							Port: 0, // Let OS choose port
+						},
+					}).DialContext,
+				},
+				Timeout: m.timeout,
 			}
-		}()
-	}
-
-	// Place chunk download jobs to channel
-	err = nil
-	for id := 0; id < len(chunks) && err == nil; {
-		select {
-		case workch <- id:
-			id++
-		case err = <-errch:
 		}
 	}
 
-	close(workch)
-	wg.Wait()
-
-	if err != nil {
-		_ = os.Remove(dstpath)
-		return err
+	// Use the global client if no specific client is set
+	if d.client == nil {
+		d.client = m.client
 	}
 
-	return nil
+	return d, nil
 }
 
 // GetSharedFolderInfo extracts handle and key from a MEGA folder link

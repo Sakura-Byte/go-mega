@@ -583,7 +583,7 @@ func TestDownloadFromSharedFolder(t *testing.T) {
 	link := "https://mega.nz/folder/PAhFHS7T#a_9EPWjRFsVNAICwHrEFqA"
 	testFileName := "Small Text File for Rclone Test.txt" // Adjust if the file name changes in the share
 	testFileSize := int64(720851726)                      // Expected size of the test file
-	testFileHandle := "jRoUhJZZ"                          // The specific handle of the test file within the shared folder
+	testFileHandle := "yUIRULwQ"                          // The specific handle of the test file within the shared folder
 
 	t.Logf("Testing download from shared link: %s", link)
 
@@ -625,6 +625,10 @@ func TestDownloadFromSharedFolder(t *testing.T) {
 			t.Fatalf("Test file node with handle %s not found in shared folder %s", testFileHandle, handle)
 		}
 	}
+
+	// Mark the node as shared and assign the correct FS context
+	targetNode.isShared = true
+	targetNode.fs = fs // Ensure the node uses the shared FS context
 
 	t.Logf("Found test file node: Name='%s', Handle='%s', Size=%d", targetNode.GetName(), targetNode.GetHash(), targetNode.GetSize())
 
